@@ -46,8 +46,6 @@
 
 #define FAILED_DECODES_RESET_THRESHOLD 20
 
-#define MAX_RECV_FRAME_RETRIES 100
-
 bool FFmpegVideoDecoder::isHardwareAccelerated()
 {
     return m_HwDecodeCfg != nullptr ||
@@ -137,7 +135,10 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_VideoFormat(0),
       m_NeedsSpsFixup(false),
       m_TestOnly(testOnly),
-      m_CanRetryReceiveFrame(RRF_UNKNOWN)
+      m_ReceiveThread(nullptr),
+      m_DecodeMutex(nullptr),
+      m_ReadFrameReadyCond(nullptr),
+      m_ReceiveThreadShouldQuit(false)
 {
     SDL_zero(m_ActiveWndVideoStats);
     SDL_zero(m_LastWndVideoStats);
@@ -167,6 +168,25 @@ IFFmpegRenderer* FFmpegVideoDecoder::getBackendRenderer()
 
 void FFmpegVideoDecoder::reset()
 {
+    // Join the receive frame first, since it may access members
+    // that we're about to destroy while we're destroying them.
+
+    SDL_LockMutex(m_DecodeMutex);
+    m_ReceiveThreadShouldQuit = true;
+    SDL_CondBroadcast(m_ReadFrameReadyCond);
+    SDL_UnlockMutex(m_DecodeMutex);
+
+    SDL_WaitThread(m_ReceiveThread, NULL);
+    SDL_DestroyCond(m_ReadFrameReadyCond);
+    SDL_DestroyMutex(m_DecodeMutex);
+
+    m_ReceiveThread = nullptr;
+    m_ReadFrameReadyCond = nullptr;
+    m_DecodeMutex = nullptr;
+    m_ReceiveThreadShouldQuit = false;
+    m_FramesIn = m_FramesOut = 0;
+    m_FrameInfoQueue.clear();
+
     delete m_Pacer;
     m_Pacer = nullptr;
 
@@ -409,6 +429,10 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, PDECODER
         // Tell overlay manager to use this frontend renderer
         Session::get()->getOverlayManager().setOverlayRenderer(m_FrontendRenderer);
     }
+
+    m_ReceiveThread = SDL_CreateThread(FFmpegVideoDecoder::receiveFrameThreadProc, "AvcodecRecv", (void*)this);
+    m_DecodeMutex = SDL_CreateMutex();
+    m_ReadFrameReadyCond = SDL_CreateCond();
 
     return true;
 }
@@ -910,11 +934,127 @@ void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
     }
 }
 
+int FFmpegVideoDecoder::receiveFrameThreadProc(void *context)
+{
+    auto me = (FFmpegVideoDecoder*)context;
+
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+
+    SDL_LockMutex(me->m_DecodeMutex);
+    for (;;) {
+        // Wait for the submission side to enqueue another frame for decoding
+        while (me->m_FramesIn == me->m_FramesOut && !me->m_ReceiveThreadShouldQuit) {
+            SDL_CondWait(me->m_ReadFrameReadyCond, me->m_DecodeMutex);
+        }
+
+        if (me->m_ReceiveThreadShouldQuit) {
+            SDL_UnlockMutex(me->m_DecodeMutex);
+            return 0;
+        }
+
+        int err = 0;
+        bool submittedFrame = false;
+        do {
+            AVFrame* frame = av_frame_alloc();
+            if (!frame) {
+                // Failed to allocate a frame but we did submit,
+                // so we can return DR_OK
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Failed to allocate frame");
+                SDL_UnlockMutex(me->m_DecodeMutex);
+                continue;
+            }
+
+            err = avcodec_receive_frame(me->m_VideoDecoderCtx, frame);
+            if (err == 0) {
+                me->m_FramesOut++;
+                SDL_assert(me->m_FramesIn >= me->m_FramesOut);
+
+                // Reset failed decodes count if we reached this far
+                me->m_ConsecutiveFailedDecodes = 0;
+
+                // Restore default log level after a successful decode
+                av_log_set_level(AV_LOG_INFO);
+
+                // Capture a frame timestamp to measuring pacing delay
+                frame->pkt_dts = SDL_GetTicks();
+
+                if (!me->m_FrameInfoQueue.isEmpty()) {
+                    FrameInfoTuple infoTuple = me->m_FrameInfoQueue.dequeue();
+
+                    // Count time in avcodec_send_packet() and avcodec_receive_frame()
+                    // as time spent decoding. Also count time spent in the decode unit
+                    // queue because that's directly caused by decoder latency.
+                    me->m_ActiveWndVideoStats.totalDecodeTime += LiGetMillis() - infoTuple.enqueueTimeMs;
+
+                    // Store the presentation time
+                    frame->pts = infoTuple.presentationTimeMs;
+                }
+                else {
+                    SDL_assert(false);
+                }
+
+                // Also count the frame-to-frame delay if the decoder is delaying frames
+                // until a subsequent frame is submitted.
+                me->m_ActiveWndVideoStats.totalDecodeTime += (me->m_FramesIn - me->m_FramesOut) * (1000 / me->m_StreamFps);
+                me->m_ActiveWndVideoStats.decodedFrames++;
+
+                // Drop the decode lock while rendering the frame
+                SDL_UnlockMutex(me->m_DecodeMutex);
+
+                // Queue the frame for rendering (or render now if pacer is disabled)
+                me->m_Pacer->submitFrame(frame);
+                submittedFrame = true;
+
+                // Relock before looping again
+                SDL_LockMutex(me->m_DecodeMutex);
+            }
+            else {
+                av_frame_free(&frame);
+
+                if (err == AVERROR(EAGAIN)) {
+                    // Don't retry if we've already gotten a frame back or if we're too far behind
+                    // (which may indicate the decoder is hung)
+                    SDL_assert(me->m_FramesIn >= me->m_FramesOut);
+                    if (submittedFrame || me->m_FramesIn - me->m_FramesOut > 16) {
+                        break;
+                    }
+                    else {
+                        // Unlock while sleeping to allow concurrent decodes to happen
+                        SDL_UnlockMutex(me->m_DecodeMutex);
+                        SDL_Delay(3);
+                        SDL_LockMutex(me->m_DecodeMutex);
+                    }
+                }
+            }
+        } while (err == 0 || err == AVERROR(EAGAIN));
+
+        // Treat this as a failed decode if we don't manage to receive a single frame or
+        // if we finish the loop above with an error other than EAGAIN.
+        if (!submittedFrame || err != AVERROR(EAGAIN)) {
+            char errorstring[512];
+            av_strerror(err, errorstring, sizeof(errorstring));
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "avcodec_receive_frame() failed: %s", errorstring);
+
+            if (++me->m_ConsecutiveFailedDecodes == FAILED_DECODES_RESET_THRESHOLD) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Resetting decoder due to consistent failure");
+
+                SDL_Event event;
+                event.type = SDL_RENDER_DEVICE_RESET;
+                SDL_PushEvent(&event);
+            }
+        }
+    }
+}
+
 int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 {
     PLENTRY entry = du->bufferList;
     int err;
-    bool submittedFrame = false;
+
+    SDL_LockMutex(m_DecodeMutex);
 
     SDL_assert(!m_TestOnly);
 
@@ -999,118 +1139,16 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             SDL_PushEvent(&event);
         }
 
+        SDL_UnlockMutex(m_DecodeMutex);
         return DR_NEED_IDR;
     }
 
+    m_FrameInfoQueue.enqueue({.enqueueTimeMs = du->enqueueTimeMs,
+                              .presentationTimeMs = du->presentationTimeMs});
     m_FramesIn++;
+    SDL_UnlockMutex(m_DecodeMutex);
 
-    // We can receive 0 or more frames after submission of a packet, so we must
-    // try to read until we get EAGAIN to ensure the queue is drained. Some decoders
-    // run asynchronously and may return several frames at once after warming up.
-    //
-    // Some decoders support calling avcodec_receive_frame() without queuing a packet.
-    // This allows us to drain excess frames and reduce latency. We will try to learn
-    // if a decoder is capable of this by trying it and seeing if it works.
-    int receiveRetries = 0;
-    do {
-        AVFrame* frame = av_frame_alloc();
-        if (!frame) {
-            // Failed to allocate a frame but we did submit,
-            // so we can return DR_OK
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Failed to allocate frame");
-            return DR_OK;
-        }
-
-        err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
-        if (err == 0) {
-            m_FramesOut++;
-
-            // Reset failed decodes count if we reached this far
-            m_ConsecutiveFailedDecodes = 0;
-
-            // Restore default log level after a successful decode
-            av_log_set_level(AV_LOG_INFO);
-
-            // Store the presentation time
-            // FIXME: This is wrong when reading a batch of frames
-            frame->pts = du->presentationTimeMs;
-
-            // Capture a frame timestamp to measuring pacing delay
-            frame->pkt_dts = SDL_GetTicks();
-
-            // Count time in avcodec_send_packet() and avcodec_receive_frame()
-            // as time spent decoding. Also count time spent in the decode unit
-            // queue because that's directly caused by decoder latency.
-            m_ActiveWndVideoStats.totalDecodeTime += LiGetMillis() - du->enqueueTimeMs;
-
-            // Also count the frame-to-frame delay if the decoder is delaying frames
-            // until a subsequent frame is submitted.
-            m_ActiveWndVideoStats.totalDecodeTime += (m_FramesIn - m_FramesOut) * (1000 / m_StreamFps);
-
-            m_ActiveWndVideoStats.decodedFrames++;
-
-            // Queue the frame for rendering (or render now if pacer is disabled)
-            m_Pacer->submitFrame(frame);
-            submittedFrame = true;
-
-            // Once we receive a frame, transition out of the Unknown state by determining
-            // whether a receive frame retry was needed to get this frame. We assume that
-            // any asynchronous decoder is going to return EAGAIN on the first frame.
-            if (m_CanRetryReceiveFrame == RRF_UNKNOWN) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "RRF mode: %s", receiveRetries > 0 ? "YES" : "NO");
-                m_CanRetryReceiveFrame = receiveRetries > 0 ? RRF_YES : RRF_NO;
-            }
-        }
-        else {
-            av_frame_free(&frame);
-
-            if (err == AVERROR(EAGAIN)) {
-                // Break out if we can't retry or we successfully received a frame. We only want
-                // to retry if we haven't gotten a frame back for this input packet.
-                if (m_CanRetryReceiveFrame == RRF_NO || receiveRetries == MAX_RECV_FRAME_RETRIES || submittedFrame) {
-                    // We will transition from Unknown -> No if we exceed the maximum retries.
-                    if (m_CanRetryReceiveFrame == RRF_UNKNOWN) {
-                        SDL_assert(!submittedFrame);
-                        SDL_assert(receiveRetries == MAX_RECV_FRAME_RETRIES);
-
-                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "RRF mode: NO (timeout)");
-                        m_CanRetryReceiveFrame = RRF_NO;
-                    }
-
-                    break;
-                }
-                else {
-                    SDL_Delay(1);
-                }
-            }
-        }
-    } while (err == 0 || (err == AVERROR(EAGAIN) && receiveRetries++ < MAX_RECV_FRAME_RETRIES));
-
-    // Treat this as a failed decode if we don't manage to receive a single frame or
-    // if we finish the loop above with an error other than EAGAIN. Note that some
-    // limited number of "failed decodes" with EAGAIN are expected for asynchronous
-    // decoders, so we only reset the decoder if we get a ton of them in a row.
-    if (!submittedFrame || err != AVERROR(EAGAIN)) {
-        // Don't spam EAGAIN log messages for asynchronous decoders as long as
-        // they produce a frame for at least every other submitted packet.
-        if (m_ConsecutiveFailedDecodes > 0 || err != AVERROR(EAGAIN)) {
-            char errorstring[512];
-            av_strerror(err, errorstring, sizeof(errorstring));
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "avcodec_receive_frame() failed: %s", errorstring);
-        }
-
-        if (++m_ConsecutiveFailedDecodes == FAILED_DECODES_RESET_THRESHOLD) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Resetting decoder due to consistent failure");
-
-            SDL_Event event;
-            event.type = SDL_RENDER_DEVICE_RESET;
-            SDL_PushEvent(&event);
-        }
-    }
-
+    SDL_CondSignal(m_ReadFrameReadyCond);
     return DR_OK;
 }
 
