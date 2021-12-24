@@ -994,9 +994,6 @@ int FFmpegVideoDecoder::receiveFrameThreadProc(void *context)
                     SDL_assert(false);
                 }
 
-                // Also count the frame-to-frame delay if the decoder is delaying frames
-                // until a subsequent frame is submitted.
-                me->m_ActiveWndVideoStats.totalDecodeTime += (me->m_FramesIn - me->m_FramesOut) * (1000 / me->m_StreamFps);
                 me->m_ActiveWndVideoStats.decodedFrames++;
 
                 // Drop the decode lock while rendering the frame
