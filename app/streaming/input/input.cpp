@@ -29,6 +29,7 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
       m_StreamHeight(streamHeight),
       m_AbsoluteMouseMode(prefs.absoluteMouseMode),
       m_AbsoluteTouchMode(prefs.absoluteTouchMode),
+      m_DisableKeyboardAndMouseInput(false),
       m_LeftButtonReleaseTimer(0),
       m_RightButtonReleaseTimer(0),
       m_DragTimer(0),
@@ -114,6 +115,11 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
     m_SpecialKeyCombos[KeyComboPasteText].keyCode = SDLK_v;
     m_SpecialKeyCombos[KeyComboPasteText].scanCode = SDL_SCANCODE_V;
     m_SpecialKeyCombos[KeyComboPasteText].enabled = true;
+
+    m_SpecialKeyCombos[KeyComboDisableKeyboardAndMouseInput].keyCombo = KeyComboDisableKeyboardAndMouseInput;
+    m_SpecialKeyCombos[KeyComboDisableKeyboardAndMouseInput].keyCode = SDLK_k;
+    m_SpecialKeyCombos[KeyComboDisableKeyboardAndMouseInput].scanCode = SDL_SCANCODE_K;
+    m_SpecialKeyCombos[KeyComboDisableKeyboardAndMouseInput].enabled = true;
 
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);

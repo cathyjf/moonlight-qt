@@ -92,6 +92,12 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
         SDL_MinimizeWindow(m_Window);
         break;
 
+    case KeyComboDisableKeyboardAndMouseInput:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected keyboard and mouse disable/enable combo");
+        m_DisableKeyboardAndMouseInput = !m_DisableKeyboardAndMouseInput;
+        break;
+
     case KeyComboPasteText:
     {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -171,6 +177,10 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
                 return;
             }
         }
+    }
+
+    if (m_DisableKeyboardAndMouseInput) {
+        return;
     }
 
     // Set modifier flags

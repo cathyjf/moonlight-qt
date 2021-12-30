@@ -106,6 +106,7 @@ private:
         KeyComboToggleCursorHide,
         KeyComboToggleMinimize,
         KeyComboPasteText,
+        KeyComboDisableKeyboardAndMouseInput,
         KeyComboMax
     };
 
@@ -180,6 +181,7 @@ private:
     int m_StreamHeight;
     bool m_AbsoluteMouseMode;
     bool m_AbsoluteTouchMode;
+    bool m_DisableKeyboardAndMouseInput;
 
     SDL_TouchFingerEvent m_TouchDownEvent[MAX_FINGERS];
     SDL_TimerID m_LeftButtonReleaseTimer;

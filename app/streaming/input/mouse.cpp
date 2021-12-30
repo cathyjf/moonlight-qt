@@ -30,6 +30,10 @@ void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
         // Ignore button presses outside the video region, but allow button releases
         return;
     }
+    else if (m_DisableKeyboardAndMouseInput) {
+        // User has requested that keyboard and mouse input be ignored.
+        return;
+    }
 
     switch (event->button)
     {
@@ -180,6 +184,10 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
         // Ignore synthetic mouse events
         return;
     }
+    else if (m_DisableKeyboardAndMouseInput) {
+        // User has requested that keyboard and mouse input be ignored.
+        return;
+    }
 
     // Batch until the next mouse polling window or we'll get awful
     // input lag everything except GFE 3.14 and 3.15.
@@ -200,6 +208,10 @@ void SdlInputHandler::handleMouseWheelEvent(SDL_MouseWheelEvent* event)
     }
     else if (event->which == SDL_TOUCH_MOUSEID) {
         // Ignore synthetic mouse events
+        return;
+    }
+    else if (m_DisableKeyboardAndMouseInput) {
+        // User has requested that keyboard and mouse input be ignored.
         return;
     }
 
